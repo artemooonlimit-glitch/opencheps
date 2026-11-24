@@ -1,0 +1,395 @@
+name: OpenCheps Trainer V2
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/trainer-v2.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply Trainer V2 modifications
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+          base=Path('app/src/main/java/com/opencheps')
+          def edit(path, old, new):
+              s=path.read_text()
+              if s.count(old)!=1: raise SystemExit(f'Expected exactly one hook in {path}: {old}')
+              path.write_text(s.replace(old,new,1))
+
+          panel=base/'overlay/FloatingPanel.java'
+          edit(panel,'recalBtn.setOnClickListener(v -> {', '''recalBtn.setOnLongClickListener(v -> {
+                      if (root != null) ManualBoardCalibration.show(ctx, wm, root, () -> {
+                          if (listener != null) listener.onRecalibrate();
+                      });
+                      return true;
+                  });
+                  recalBtn.setOnClickListener(v -> {
+                      ManualBoardCalibration.clear();''')
+          edit(panel,'public void detach() {','public void detach() {\n        ManualBoardCalibration.close(false);\n        ManualBoardCalibration.clear();')
+          service=base/'capture/ScreenCaptureService.java'
+          edit(service,'private void sampleOnce() {', '''private void sampleOnce() {
+                  if (com.opencheps.overlay.ManualBoardCalibration.isSelecting()) {
+                      drainReader(); return;
+                  }''')
+          edit(service,'BoardDetector.Board board = BoardDetector.locate(bmp);', '''BoardDetector.Board board = com.opencheps.overlay.ManualBoardCalibration.hasBounds()
+                          ? com.opencheps.overlay.ManualBoardCalibration.forFrame(bmp)
+                          : BoardDetector.locate(bmp);''')
+          # Reset learning on the worker, before processing additional frames.
+          old='''@Override public void onRecalibrate() {
+                                  classifier.reset();
+                                  resetGameState();'''
+          s=service.read_text()
+          pattern=r'(@Override public void onRecalibrate\(\)\s*\{)\s*classifier\.reset\(\);\s*resetGameState\(\);\s*OverlayService\.clearAll\(\);\s*panelStatus\("Recalibrating · show starting position"\);\s*\}'
+          replacement='''@Override public void onRecalibrate() {
+                                  if (worker != null) worker.post(() -> {
+                                      drainReader();
+                                      classifier.reset();
+                                      resetGameState();
+                                      OverlayService.clearAll();
+                                      panelStatus("Recalibrating · show starting position");
+                                  });
+                              }'''
+          s,n=re.subn(pattern,lambda _:replacement,s)
+          if n!=1: raise SystemExit('Recalibration hook changed')
+          service.write_text(s)
+          # Make manual screen coordinates local to the actual drawing window, exactly once.
+          a=base/'overlay/ArrowOverlayView.java'
+          s=a.read_text()
+          if 'c.translate(-location[0], -location[1]);' not in s:
+              edit(a,'protected void onDraw(Canvas c) {','protected void onDraw(Canvas c) {\n        int[] location = new int[2];\n        getLocationOnScreen(location);\n        c.translate(-location[0], -location[1]);')
+          # Allow full-width automatic candidates and include boundaries in the search.
+          detector=base/'vision/BoardDetector.java'
+          edit(detector,'(int) (Math.min(W, H) * 0.98)','Math.min(W, H)')
+          edit(detector,'y + corrected < H','y + corrected <= H')
+          edit(detector,'x + corrected < W','x + corrected <= W')
+          edit(detector,'x + c.side >= W || y + c.side >= H','x + c.side > W || y + c.side > H')
+          edit(detector,'x + newSide >= W || y + newSide >= H','x + newSide > W || y + newSide > H')
+          # Separate Android package: can coexist with the previous build.
+          gradle=Path('app/build.gradle')
+          edit(gradle,'applicationId "com.opencheps"','applicationId "com.opencheps.trainer"')
+          manifest=Path('app/src/main/AndroidManifest.xml')
+          edit(manifest,'android:label="@string/app_name"','android:label="OpenCheps Trainer V2"')
+          edit(gradle,'versionCode 1','versionCode 2')
+          edit(gradle,'versionName "0.2.0"','versionName "2.0"')
+          edit(gradle,"include 'arm64-v8a', 'armeabi-v7a'","include 'arm64-v8a'")
+          # Improve full-width search by explicitly visiting the largest candidate.
+          edit(detector,'for (int s = minSide; s <= maxSide; s += sizeStep) {','for (int s = minSide; s <= maxSide; s = s == maxSide ? maxSide + 1 : Math.min(maxSide, s + sizeStep)) {')
+          # Faster sampling and clear old hints immediately when a changed grid is seen.
+          edit(service,'SAMPLE_PERIOD_MS = 500','SAMPLE_PERIOD_MS = 150')
+          edit(service,'if (!gridsEqual(grid, candidateGrid)) {','''// Never keep arrows for an unconfirmed new position.
+                      OverlayService.clearArrowsOnly();
+                      panelEval("");
+                      if (!gridsEqual(grid, candidateGrid)) {''')
+          edit(service,'if (board == null) {','if (board == null) {\n                OverlayService.clearArrowsOnly();\n                panelEval("");')
+          edit(service,'if (grid == null) return;','if (grid == null) { OverlayService.clearArrowsOnly(); panelEval(""); return; }')
+          # Do not display outdated results if a move was made while engine was busy.
+          edit(service,'if (pvs.isEmpty()) { panelStatus("No legal move"); return; }','''if (paused || com.opencheps.overlay.ManualBoardCalibration.isSelecting() || !positionStillCurrent(board)) {
+                          lastEngineFen = "";
+                          currentArrows.clear();
+                          OverlayService.clearArrowsOnly();
+                          panelEval("");
+                          return;
+                      }
+                      if (pvs.isEmpty()) { panelStatus("No legal move"); return; }''')
+          edit(service,'private void repushCurrentArrows(BoardDetector.Board board) {','''private boolean positionStillCurrent(BoardDetector.Board board) {
+                  if (reader == null) return false;
+                  Image latest = null;
+                  Bitmap frame = null;
+                  try {
+                      latest = reader.acquireLatestImage();
+                      if (latest == null) return true;
+                      frame = imageToBitmap(latest);
+                      char[][] seen = classifier.classifyBoard(frame, board);
+                      return seen != null && gridsEqual(repairWithMoveLogic(confirmedGrid, seen), confirmedGrid);
+                  } catch (Exception e) { return false; }
+                  finally {
+                      if (frame != null) frame.recycle();
+                      if (latest != null) latest.close();
+                  }
+              }
+              private void repushCurrentArrows(BoardDetector.Board board) {''')
+          # Keep arrows consistent with any updated board geometry.
+          edit(service,'private List<ArrowOverlayView.Arrow> currentArrows = new ArrayList<>();','private List<ArrowOverlayView.Arrow> currentArrows = new ArrayList<>();\n    private List<StockfishEngine.Pv> currentPvs = new ArrayList<>();')
+          edit(service,'currentArrows = buildArrows(pvs, board);','currentPvs = new ArrayList<>(pvs);\n            currentArrows = buildArrows(pvs, board);')
+          edit(service,'return currentArrows;','return buildArrows(currentPvs, board);')
+          # Synchronize overlay list mutations with UI drawing.
+          av=a.read_text()
+          for hook in ['void setArrows(', 'void setBoardBounds(', 'void setBoardFrameColor(', 'void clearArrowsOnly(', 'void clearAll(']:
+              av=av.replace('public '+hook,'public synchronized '+hook)
+          av=av.replace('protected void onDraw(Canvas c)', 'protected synchronized void onDraw(Canvas c)')
+          a.write_text(av)
+          # Stockfish settings are stored on device and read on the next search.
+          prefs=base/'util/Prefs.java'
+          edit(prefs,'public static int thinkMs(Context c)', '''public static int threads(Context c) { return Math.max(1, Math.min(4, get(c).getInt("sf_threads", 2))); }
+              public static int hashMb(Context c) { return Math.max(16, Math.min(128, get(c).getInt("sf_hash", 48))); }
+              public static int depth(Context c) { return Math.max(1, Math.min(30, get(c).getInt("sf_depth", 20))); }
+              public static int skill(Context c) { return Math.max(0, Math.min(20, get(c).getInt("sf_skill", 20))); }
+              public static int thinkMs(Context c)''')
+          engine=base/'engine/StockfishEngine.java'
+          edit(engine,'private volatile int currentMultiPv = 0;', '''private volatile int currentMultiPv = 0;
+              private Context settingsContext;
+              private int appliedThreads=-1, appliedHash=-1, appliedSkill=-1;
+              private void applySettings() throws Exception {
+                  int threads=com.opencheps.util.Prefs.threads(settingsContext);
+                  int hash=com.opencheps.util.Prefs.hashMb(settingsContext);
+                  int skill=com.opencheps.util.Prefs.skill(settingsContext);
+                  if (threads != appliedThreads || hash != appliedHash || skill != appliedSkill) {
+                      send("setoption name Threads value " + threads);
+                      send("setoption name Hash value " + hash);
+                      send("setoption name Skill Level value " + skill);
+                      send("isready"); waitFor("readyok", 6000);
+                      appliedThreads=threads; appliedHash=hash; appliedSkill=skill;
+                  }
+              }''')
+          edit(engine,'send("setoption name Threads value 2");','settingsContext = ctx.getApplicationContext();\n        appliedThreads=appliedHash=appliedSkill=-1;\n        applySettings();')
+          edit(engine,'send("setoption name Hash value 48");','// Hash is set through user preferences.')
+          edit(engine,'setMultiPv(multiPv);','applySettings();\n        setMultiPv(multiPv);')
+          edit(engine,'send("go movetime " + movetimeMs);','send("go movetime " + movetimeMs + " depth " + com.opencheps.util.Prefs.depth(settingsContext));')
+          edit(engine,'Stockfish 18 ready:', 'Stockfish 19 ready:')
+          ui=base/'ui/MainActivity.java'
+          edit(ui,'btnOverlay.setOnClickListener(v -> requestOverlay());','''findViewById(R.id.btnEngineSettings).setOnClickListener(v -> showEngineSettings());
+                  btnOverlay.setOnClickListener(v -> requestOverlay());''')
+          edit(ui,'projectionLauncher.launch(mpm.createScreenCaptureIntent());','''projectionLauncher.launch(Build.VERSION.SDK_INT >= 34
+                          ? mpm.createScreenCaptureIntent(android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay())
+                          : mpm.createScreenCaptureIntent());''')
+          edit(ui,'private String thinkLabelText(int ms) {','''private android.widget.SeekBar settingSlider(android.widget.LinearLayout box, String title, int min, int max, int value) {
+                  TextView label = new TextView(this);
+                  label.setText(title + ": " + value); box.addView(label);
+                  SeekBar bar = new SeekBar(this); bar.setMax(max-min); bar.setProgress(value-min);
+                  box.addView(bar);
+                  bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      public void onProgressChanged(SeekBar b,int p,boolean user) { label.setText(title + ": " + (p+min)); }
+                      public void onStartTrackingTouch(SeekBar b) {}
+                      public void onStopTrackingTouch(SeekBar b) {}
+                  });
+                  return bar;
+              }
+              private void showEngineSettings() {
+                  android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+                  box.setOrientation(android.widget.LinearLayout.VERTICAL);
+                  int pad=(int)(20*getResources().getDisplayMetrics().density); box.setPadding(pad,pad,pad,0);
+                  SeekBar threads=settingSlider(box,"Threads",1,4,Prefs.threads(this));
+                  SeekBar hash=settingSlider(box,"Hash (MB)",16,128,Prefs.hashMb(this));
+                  SeekBar depth=settingSlider(box,"Depth limit",1,30,Prefs.depth(this));
+                  SeekBar skill=settingSlider(box,"Skill level",0,20,Prefs.skill(this));
+                  new androidx.appcompat.app.AlertDialog.Builder(this).setTitle("Stockfish 19 settings")
+                      .setView(box).setNegativeButton("Cancel",null)
+                      .setNeutralButton("Defaults",(d,w)->{ Prefs.get(this).edit().putInt("sf_threads",2).putInt("sf_hash",48).putInt("sf_depth",20).putInt("sf_skill",20).apply(); })
+                      .setPositiveButton("Save",(d,w)->{ Prefs.get(this).edit().putInt("sf_threads",threads.getProgress()+1)
+                          .putInt("sf_hash",hash.getProgress()+16).putInt("sf_depth",depth.getProgress()+1)
+                          .putInt("sf_skill",skill.getProgress()).apply(); }).show();
+              }
+              private String thinkLabelText(int ms) {''')
+          s=ui.read_text()
+          s,n=re.subn(r'private String thinkLabelText\(int ms\) \{.*?\n    \}', 'private String thinkLabelText(int ms) { return "Think time: " + ms + " ms (maximum)"; }',s,flags=re.S)
+          if n!=1: raise SystemExit('Think label hook missing')
+          ui.write_text(s)
+          layout=Path('app/src/main/res/layout/activity_main.xml')
+          edit(layout,'        <TextView\n            android:text="@string/how_it_works"','''        <Button
+                          android:id="@+id/btnEngineSettings"
+                          android:text="Stockfish 19 settings"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"/>
+                      <TextView
+                          android:text="Training vs computer only. Hold blue calibration button and select both corners."
+                          android:textColor="#FFFFFFFF"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"/>
+                      <TextView
+                          android:text="@string/how_it_works"''')
+          edit(layout,'Longer = stronger play but slower response. Stockfish 18 reaches ≈3300 elo at 2 s on 2 cores.','Stockfish 19: time and depth are upper limits for each search.')
+          edit(layout,'Think time: 1500 ms — strong (≈3000 elo)','Think time: 1500 ms')
+          strings=Path('app/src/main/res/values/strings.xml')
+          edit(strings,'<string name="app_name">OpenCheps</string>','<string name="app_name">OpenCheps Trainer V2</string>')
+          edit(strings,'Stockfish 18','Stockfish 19')
+          print('V2 modifications applied.')
+
+          PYTHON
+          cat > app/src/main/java/com/opencheps/overlay/ManualBoardCalibration.java <<'JAVA'
+          package com.opencheps.overlay;
+
+          import android.content.Context;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.graphics.RectF;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Toast;
+          import com.opencheps.vision.BoardDetector;
+
+          /** Manual screen geometry; active only for the current capture session. */
+          public final class ManualBoardCalibration {
+              private static volatile RectF bounds;
+              private static volatile boolean selecting;
+              private static volatile float aspect;
+              private static Picker picker;
+              private static final Handler UI = new Handler(Looper.getMainLooper());
+              private static final Runnable TIMEOUT = () -> close(false);
+
+              private ManualBoardCalibration() {}
+              public static boolean isSelecting() { return selecting; }
+              public static boolean hasBounds() { return bounds != null; }
+              public static void clear() { bounds = null; }
+
+              public static BoardDetector.Board forFrame(Bitmap frame) {
+                  RectF r = bounds;
+                  if (r == null || frame == null) return null;
+                  int w = frame.getWidth(), h = frame.getHeight();
+                  if (Math.abs((float) w / h - aspect) > 0.015f) return null;
+                  int left = Math.max(0, Math.round(r.left * w));
+                  int top = Math.max(0, Math.round(r.top * h));
+                  int side = Math.round((r.width() * w + r.height() * h) / 2f);
+                  side = Math.min(side, Math.min(w-left, h-top));
+                  if (side < 64) return null;
+                  return new BoardDetector.Board(left, top, side, 100.0);
+              }
+
+              public static void show(Context ctx, WindowManager wm, View panel, Runnable onDone) {
+                  if (picker != null) return;
+                  DisplayMetrics dm = new DisplayMetrics();
+                  wm.getDefaultDisplay().getRealMetrics(dm);
+                  if (dm.widthPixels <= 0 || dm.heightPixels <= 0) return;
+                  Picker v = new Picker(ctx, wm, panel, onDone, dm.widthPixels, dm.heightPixels);
+                  int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          : WindowManager.LayoutParams.TYPE_PHONE;
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(-1, -1, type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                          | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                          | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.LEFT;
+                  selecting = true;
+                  picker = v;
+                  OverlayService.clearAll();
+                  panel.setVisibility(View.INVISIBLE);
+                  try {
+                      wm.addView(v, lp);
+                      UI.postDelayed(TIMEOUT, 30000);
+                  } catch (RuntimeException e) {
+                      close(false);
+                      Toast.makeText(ctx, "Cannot open calibration", Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              public static void close(boolean confirmed) {
+                  Picker v = picker;
+                  if (v == null) return;
+                  picker = null;
+                  UI.removeCallbacks(TIMEOUT);
+                  try { v.wm.removeViewImmediate(v); } catch (RuntimeException ignored) {}
+                  v.panel.setVisibility(View.VISIBLE);
+                  try { if (confirmed) v.onDone.run(); }
+                  finally { selecting = false; }
+              }
+
+              private static final class Picker extends View {
+                  final WindowManager wm;
+                  final View panel;
+                  final Runnable onDone;
+                  final int sw, sh;
+                  final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  float x1 = -1, y1, downX, downY;
+                  Picker(Context c, WindowManager w, View panel, Runnable done, int sw, int sh) {
+                      super(c); this.wm = w; this.panel = panel; this.onDone = done;
+                      this.sw = sw; this.sh = sh; setClickable(true);
+                  }
+                  @Override protected void onDraw(Canvas c) {
+                      float d = getResources().getDisplayMetrics().density;
+                      p.setStyle(Paint.Style.FILL); p.setColor(0xE6222222);
+                      c.drawRect(0, 0, getWidth(), 92*d, p);
+                      p.setColor(Color.WHITE); p.setTextSize(16*d); p.setTextAlign(Paint.Align.CENTER);
+                      c.drawText(x1 < 0 ? "Tap board TOP-LEFT corner" : "Tap board BOTTOM-RIGHT corner", getWidth()/2f, 35*d, p);
+                      p.setColor(0xFFB0E8FF); p.setTextSize(14*d);
+                      c.drawText("Cancel (tap here)", getWidth()/2f, 72*d, p);
+                      if (x1 >= 0) {
+                          int[] loc = new int[2]; getLocationOnScreen(loc);
+                          float x = x1 - loc[0], y = y1 - loc[1];
+                          p.setColor(0xFF00E676); p.setStrokeWidth(3*d);
+                          c.drawLine(x-12*d,y,x+12*d,y,p); c.drawLine(x,y-12*d,x,y+12*d,p);
+                      }
+                  }
+                  @Override public boolean onTouchEvent(MotionEvent e) {
+                      if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                          downX=e.getRawX(); downY=e.getRawY(); return true;
+                      }
+                      if (e.getActionMasked() != MotionEvent.ACTION_UP) return true;
+                      float d = getResources().getDisplayMetrics().density;
+                      if (e.getY() < 92*d) { close(false); return true; }
+                      if (Math.hypot(e.getRawX()-downX,e.getRawY()-downY)>20*d) return true;
+                      float x = Math.max(0, Math.min(sw, e.getRawX()));
+                      float y = Math.max(0, Math.min(sh, e.getRawY()));
+                      if (x1 < 0) { x1=x; y1=y; invalidate(); return true; }
+                      float dx=x-x1, dy=y-y1;
+                      if (dx<sw*0.25f || dy<sw*0.25f || Math.abs(dx-dy)>Math.max(dx,dy)*0.10f) {
+                          x1=-1; invalidate();
+                          Toast.makeText(getContext(), "Select two opposite corners of a square board", Toast.LENGTH_SHORT).show();
+                          return true;
+                      }
+                      float side=(dx+dy)/2f;
+                      float left=Math.max(0, Math.min(sw-side,(x1+x-side)/2f));
+                      float top=Math.max(0, Math.min(sh-side,(y1+y-side)/2f));
+                      side=Math.min(side,Math.min(sw-left,sh-top));
+                      aspect=(float)sw/sh;
+                      bounds=new RectF(left/sw,top/sh,(left+side)/sw,(top+side)/sh);
+                      close(true);
+                      Toast.makeText(getContext(), "Board locked. Start from initial position.", Toast.LENGTH_SHORT).show();
+                      return true;
+                  }
+              }
+          }
+          JAVA
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v3
+      - name: Prepare Gradle
+        run: gradle wrapper --gradle-version 8.7 --distribution-type bin && chmod +x gradlew
+      - name: Download verified Stockfish 19 (Android ARM64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sf19"
+          url=https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-android-arm64-universal.tar.gz
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/sf19.tar.gz"
+          echo "ebb24051aa4a222b4daaf049b882ecf1163d370c128fe02316602643f4d5e426  $RUNNER_TEMP/sf19.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/sf19.tar.gz" -C "$RUNNER_TEMP/sf19"
+          mapfile -t binaries < <(find "$RUNNER_TEMP/sf19" -type f -name 'stockfish*' -exec file {} + | awk -F: '/ELF.*ARM aarch64|ELF.*ARM64|ELF.*aarch64/ {print $1}')
+          if [ "${#binaries[@]}" != 1 ]; then find "$RUNNER_TEMP/sf19" -type f; exit 1; fi
+          install -Dm755 "${binaries[0]}" app/src/main/jniLibs/arm64-v8a/libstockfish.so
+          mkdir -p app/src/main/assets/licenses
+          curl -fL https://raw.githubusercontent.com/official-stockfish/Stockfish/sf_19/Copying.txt -o app/src/main/assets/licenses/Stockfish-GPL.txt
+          printf '%s\n' 'Stockfish 19 source: https://github.com/official-stockfish/Stockfish/tree/sf_19' > app/src/main/assets/licenses/Stockfish-source.txt
+          cp LICENSE app/src/main/assets/licenses/OpenCheps-MIT.txt
+      - name: Build APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+      - name: Prepare download
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mapfile -t apks < <(find app/build/outputs/apk/debug -name '*arm64-v8a*.apk')
+          test "${#apks[@]}" = 1
+          cp "${apks[0]}" dist/OpenCheps-Trainer-V2-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCheps-Trainer-V2-arm64
+          path: dist/OpenCheps-Trainer-V2-arm64.apk
+          if-no-files-found: error
