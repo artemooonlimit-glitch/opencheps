@@ -82,6 +82,10 @@ public class ArrowOverlayView extends View {
     }
 
     @Override protected void onDraw(Canvas c) {
+        int[] location = new int[2];
+getLocationOnScreen(location);
+c.translate(-location[0], -location[1]);
+        
         if (boardBounds != null) {
             frame.setColor(boardFrameColor);
             c.drawRect(boardBounds, frame);
